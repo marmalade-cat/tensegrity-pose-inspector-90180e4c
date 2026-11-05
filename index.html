@@ -1,0 +1,170 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Tensegrity Pose Inspector</title>
+  <style>
+    body{font-family:system-ui,Arial;margin:18px;color:#222}
+    header{margin-bottom:12px}
+    .file-list{margin:8px 0}
+    .result{border:1px solid #ddd;padding:8px;margin:8px 0;border-radius:6px}
+    .flag{color:#a33;font-weight:600}
+    svg{background:#fff;border:1px solid #eee}
+    .small{font-size:0.9em;color:#555}
+    button{margin-left:8px}
+  </style>
+</head>
+<body>
+  <header>
+    <h2>Tensegrity Pose Inspector</h2>
+    <div class="small">Upload CSV or ZIP (containing CSVs). The tool heuristically finds per-module pose/time-series tables and shows a quick summary and preview.</div>
+  </header>
+
+  <input id="file" type="file" multiple />
+  <div class="file-list" id="files"></div>
+  <div id="report"></div>
+
+<script>
+// Minimal ZIP reader for uncompressed ZIP entries (very small heuristic). For prototype only.
+function readAsArrayBuffer(file){return new Promise((r,rej)=>{const fr=new FileReader();fr.onload=e=>r(e.target.result);fr.onerror=rej;fr.readAsArrayBuffer(file);});}
+function parseZip(buffer){
+  const view=new DataView(buffer);
+  const texts=[];let i=0;const little=true;
+  while(i+30<view.byteLength){
+    if(view.getUint32(i, little)!==0x04034b50) break; // local file header
+    const nameLen=view.getUint16(i+26,little);
+    const extraLen=view.getUint16(i+28,little);
+    const compMethod=view.getUint16(i+8,little);
+    const compSize=view.getUint32(i+18,little);
+    const nameStart=i+30;
+    const nameBytes=new Uint8Array(buffer,nameStart,nameLen);
+    const name=new TextDecoder().decode(nameBytes);
+    const dataStart=nameStart+nameLen+extraLen;
+    if(compMethod===0){ // stored
+      const data=new Uint8Array(buffer,dataStart,compSize);
+      const text=new TextDecoder().decode(data);
+      texts.push({name,content:text});
+    }
+    i=dataStart+compSize;
+  }
+  return texts;
+}
+
+function sniffCSV(text){
+  // split lines, detect header-like first row
+  const lines=text.split(/\r?\n/).map(s=>s.trim()).filter(Boolean).slice(0,200);
+  if(lines.length<2) return null;
+  const delim = [',','\t',';','|'].find(d=>lines[0].includes(d))||',';
+  const header=lines[0].split(delim).map(h=>h.trim().toLowerCase());
+  const cols=header.length;
+  // heuristics: look for time, module, x/y/z, quat, roll/pitch/yaw
+  const hasTime=header.some(h=>/time|t\b|timestamp/.test(h));
+  const hasModule=header.some(h=>/module|id|node|segment/.test(h));
+  const hasPos=(header.some(h=>/x\b/.test(h)) && header.some(h=>/y\b/.test(h))) || header.some(h=>/position/.test(h));
+  const hasZ=header.some(h=>/z\b/.test(h));
+  const hasQuat=header.some(h=>/quat|q0|q1|q2|q3|qw|qx|qy|qz/.test(h));
+  const hasAngles=header.some(h=>/roll|pitch|yaw|theta|phi/.test(h));
+  // check numeric density for first 20 rows
+  let numericCount=0; let valCount=0;
+  for(let r=1;r<Math.min(lines.length,21);r++){
+    const parts=lines[r].split(delim);
+    for(let c=0;c<parts.length;c++){const v=parts[c].trim(); if(v!==''){valCount++; if(!isNaN(Number(v))) numericCount++;}}
+  }
+  const numericDensity = valCount? numericCount/valCount : 0;
+  return {cols,hasTime,hasModule,hasPos,hasZ,hasQuat,hasAngles,numericDensity,header,delim};
+}
+
+function parseCSV(text, delim){
+  const lines=text.split(/\r?\n/).filter(l=>l.trim());
+  const header=lines[0].split(delim).map(s=>s.trim());
+  const rows=[];
+  for(let i=1;i<lines.length;i++){
+    const parts=lines[i].split(delim).map(s=>s.trim());
+    if(parts.length!==header.length) continue;
+    const obj={}; for(let j=0;j<header.length;j++) obj[header[j]]=parts[j];
+    rows.push(obj);
+  }
+  return {header,rows};
+}
+
+function summarizeTable(name, text){
+  const meta=sniffCSV(text);
+  if(!meta) return {name, readable:false};
+  const score = (meta.hasTime?2:0)+(meta.hasModule?1:0)+(meta.hasPos?2:0)+(meta.hasQuat?1:0)+(meta.numericDensity>0.7?1:0);
+  const likelyPose = score>=4;
+  return {name, readable:true, meta, likelyPose, score};
+}
+
+function quickPlot(rows, header){
+  // try to pick first numeric x (time) and one y (x or position)
+  const keys=header;
+  const numericKeys=[];
+  for(const k of keys){
+    for(let i=0;i<Math.min(rows.length,20);i++){ if(!isNaN(Number(rows[i][k]))) { numericKeys.push(k); break; } }
+  }
+  if(numericKeys.length<2) return null;
+  const xk=numericKeys[0], yk=numericKeys[1];
+  const data=rows.slice(0,200).map(r=>({x:Number(r[xk]),y:Number(r[yk])})).filter(p=>isFinite(p.x)&&isFinite(p.y));
+  if(data.length<2) return null;
+  // svg line
+  const w=420,h=140, pad=28;
+  const xs=data.map(d=>d.x), ys=data.map(d=>d.y);
+  const xmin=Math.min(...xs), xmax=Math.max(...xs), ymin=Math.min(...ys), ymax=Math.max(...ys);
+  const sx=v=>pad + ( (v-xmin)/(xmax-xmin||1) )*(w-2*pad);
+  const sy=v=>h-pad - ( (v-ymin)/(ymax-ymin||1) )*(h-2*pad);
+  const path = data.map((d,i)=>(i? ' L ':'M ')+sx(d.x)+' '+sy(d.y)).join('');
+  const svg = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}"><path d="${path}" fill="none" stroke="#2a6" stroke-width="1.6"/></svg>`;
+  return {svg,xk,yk};
+}
+
+async function handleFiles(files){
+  const out=document.getElementById('report'); out.innerHTML='';
+  for(const f of files){
+    const div=document.createElement('div'); div.className='result'; div.innerHTML=`<strong>${f.name}</strong> <span class=small>(${f.size} bytes)</span>`;
+    out.appendChild(div);
+    try{
+      if(f.name.toLowerCase().endsWith('.zip')){
+        const buf=await readAsArrayBuffer(f);
+        const entries=parseZip(buf);
+        if(entries.length===0) div.appendChild(Object.assign(document.createElement('div'),{textContent:'ZIP contains no stored CSV entries (only compressed entries or empty).'}));
+        for(const e of entries){
+          const s=summarizeTable(e.name,e.content);
+          const sdiv=document.createElement('div'); sdiv.style.marginTop='6px';
+          sdiv.innerHTML=`<em>${e.name}</em> — ${s.readable? (s.likelyPose? '<strong>Likely pose/time-series</strong>':'Table found') : 'Not recognized as CSV'}<div class=small>${s.readable? 'Score:'+s.score+' NumericDensity:'+Number(s.meta.numericDensity).toFixed(2):''}</div>`;
+          if(s.readable){
+            const parsed=parseCSV(e.content,s.meta.delim);
+            const plot=quickPlot(parsed.rows, parsed.header);
+            if(plot){ const wrap=document.createElement('div'); wrap.innerHTML=plot.svg; sdiv.appendChild(wrap); }
+            if(!s.likelyPose){ const ftag=document.createElement('div'); ftag.className='flag'; ftag.textContent='May be missing pose/time-series columns (time, module, x,y).'; sdiv.appendChild(ftag); }
+          }
+          div.appendChild(sdiv);
+        }
+      } else {
+        const text=await f.text();
+        const s=summarizeTable(f.name,text);
+        const sdiv=document.createElement('div'); sdiv.style.marginTop='6px';
+        sdiv.innerHTML=`${s.readable? (s.likelyPose? '<strong>Likely pose/time-series</strong>':'Table found') : 'Not recognized as CSV/text table' } <div class=small>${s.readable? 'Score:'+s.score+' NumericDensity:'+Number(s.meta.numericDensity).toFixed(2):''}</div>`;
+        if(s.readable){
+          const parsed=parseCSV(text,s.meta.delim);
+          const plot=quickPlot(parsed.rows, parsed.header);
+          if(plot){ const wrap=document.createElement('div'); wrap.innerHTML=plot.svg; sdiv.appendChild(wrap); }
+          if(!s.likelyPose){ const ftag=document.createElement('div'); ftag.className='flag'; ftag.textContent='May be missing pose/time-series columns (time, module, x,y).'; sdiv.appendChild(ftag); }
+        }
+        div.appendChild(sdiv);
+      }
+    } catch(err){
+      const e=document.createElement('div'); e.textContent='Error reading file: '+err.message; div.appendChild(e);
+    }
+  }
+  // follow-up checklist heuristic
+  const checklist=document.createElement('div'); checklist.className='result'; checklist.innerHTML='<strong>Follow-up checklist</strong>';
+  checklist.innerHTML += '<ul class=small><li>Do authors provide one CSV per recording run or a single combined file? Prefer one CSV per run.</li><li>Are module IDs and a time column present? If not, request the raw numeric tables.</li><li>Provide orientation as quaternions or consistent Euler angles; indicate conventions.</li><li>If ZIP contained only compressed entries, ask for stored CSVs or an exported CSV.</li></ul>';
+  out.appendChild(checklist);
+}
+
+document.getElementById('file').addEventListener('change', e=>{
+  handleFiles(e.target.files);
+});
+</script>
+</body>
+</html>
